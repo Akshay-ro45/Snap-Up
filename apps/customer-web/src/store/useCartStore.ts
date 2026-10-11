@@ -1,0 +1,180 @@
+import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
+
+export interface Product {
+  id: string;
+  barcode: string;
+  name: string;
+  /** Stored in paise/cents to eliminate floating-point calculation issues */
+  unit_price: number;
+  expected_weight_grams: number;
+}
+
+export interface CartItem extends Product {
+  quantity: number;
+}
+
+interface CartState {
+  items: CartItem[];
+  totalPrice: number;
+  totalExpectedWeight: number;
+  guestSessionId: string;
+  /**
+   * True while checkout is pricing the basket server-side.
+   *
+   * §3 asks for cart mutation to be frozen during checkout validation, and the reason is
+   * concrete: the server prices what it was sent, so an item added between the request
+   * and the response is an item the customer sees in their trolley and not on their
+   * bill. The lock is a UX guarantee, not a security one — the server would simply
+   * re-price a changed basket — but it is the difference between a correct total and an
+   * argument at the exit.
+   */
+  locked: boolean;
+  setLocked: (locked: boolean) => void;
+
+  /**
+   * Returns false when the basket is locked and the product was refused. Callers must
+   * check it: a scan the trolley declined must not be shown to the customer as added.
+   */
+  addProduct: (product: Product) => boolean;
+  updateQuantity: (productId: string, quantity: number) => void;
+  removeProduct: (productId: string) => void;
+  /** Re-inserts a previously removed item at its original index, preserving
+   *  exact quantity — used by the cart's "Undo" toast. Distinct from
+   *  addProduct, which always adds quantity 1 or increments an existing line. */
+  restoreItem: (item: CartItem, atIndex: number) => void;
+  clearCart: () => void;
+}
+
+/**
+ * Display-only totals.
+ *
+ * These drive the cart and checkout UI so it responds instantly, but they are never what
+ * anyone is charged: at checkout the basket is sent to `POST /api/orders` as product ids
+ * and quantities, and the server re-prices it from the store's catalogue. The exit token
+ * used to be minted here from these numbers, which made both the amount paid and the
+ * expected basket weight editable from devtools; it is now issued and signed server-side.
+ */
+function recalcTotals(items: CartItem[]) {
+  const totalPrice = items.reduce((acc, item) => acc + item.unit_price * item.quantity, 0);
+  const totalExpectedWeight = items.reduce(
+    (acc, item) => acc + item.expected_weight_grams * item.quantity,
+    0
+  );
+  return { totalPrice, totalExpectedWeight };
+}
+
+function createGuestSessionId() {
+  // crypto.randomUUID is available in all modern browsers (and Node 19+ for SSR safety).
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return `guest_${crypto.randomUUID()}`;
+  }
+  // Fallback for older environments — not cryptographically strong, only used as a
+  // client-side correlation key, never as an auth credential.
+  return `guest_${Math.random().toString(36).slice(2)}${Date.now()}`;
+}
+
+export const useCartStore = create<CartState>()(
+  persist(
+    (set, get) => ({
+      items: [],
+      totalPrice: 0,
+      totalExpectedWeight: 0,
+      guestSessionId: createGuestSessionId(),
+
+      locked: false,
+      setLocked: (locked) => set({ locked }),
+
+      addProduct: (product) => {
+        // Refused rather than queued. A scan that silently lands after checkout has
+        // priced the basket would put an item in the trolley that nobody charged for.
+        if (get().locked) return false;
+        set((state) => {
+          const existingIndex = state.items.findIndex((item) => item.id === product.id);
+          const updatedItems = [...state.items];
+
+          if (existingIndex >= 0) {
+            updatedItems[existingIndex] = {
+              ...updatedItems[existingIndex],
+              quantity: updatedItems[existingIndex].quantity + 1,
+            };
+          } else {
+            updatedItems.push({ ...product, quantity: 1 });
+          }
+
+          const { totalPrice, totalExpectedWeight } = recalcTotals(updatedItems);
+          return { items: updatedItems, totalPrice, totalExpectedWeight };
+        });
+        return true;
+      },
+
+      updateQuantity: (productId, quantity) => {
+        if (get().locked) return;
+        if (quantity <= 0) {
+          get().removeProduct(productId);
+          return;
+        }
+
+        set((state) => {
+          const updatedItems = state.items.map((item) =>
+            item.id === productId ? { ...item, quantity } : item
+          );
+          const { totalPrice, totalExpectedWeight } = recalcTotals(updatedItems);
+          return { items: updatedItems, totalPrice, totalExpectedWeight };
+        });
+      },
+
+      // FIX from the original useCartStore.ts: the previous version returned
+      // `{ updatedItems, ... }` instead of `{ items: updatedItems, ... }`, so the
+      // `items` key in state was never actually updated and removal silently failed.
+      removeProduct: (productId) => {
+        set((state) => {
+          const updatedItems = state.items.filter((item) => item.id !== productId);
+          const { totalPrice, totalExpectedWeight } = recalcTotals(updatedItems);
+          return { items: updatedItems, totalPrice, totalExpectedWeight };
+        });
+      },
+
+      restoreItem: (item, atIndex) => {
+        set((state) => {
+          // Guard against double-restore (e.g. a stale Undo toast tapped twice).
+          if (state.items.some((existing) => existing.id === item.id)) {
+            return state;
+          }
+          const updatedItems = [...state.items];
+          const insertAt = Math.min(Math.max(atIndex, 0), updatedItems.length);
+          updatedItems.splice(insertAt, 0, item);
+          const { totalPrice, totalExpectedWeight } = recalcTotals(updatedItems);
+          return { items: updatedItems, totalPrice, totalExpectedWeight };
+        });
+      },
+
+      // A finished checkout releases the lock with the basket. The next session starts
+      // able to scan, whatever state the last one ended in.
+      clearCart: () =>
+        set({ items: [], totalPrice: 0, totalExpectedWeight: 0, locked: false }),
+    }),
+    {
+      name: 'snapup-cart-storage',
+      // Avoid attempting to touch localStorage during SSR.
+      skipHydration: typeof window === 'undefined',
+      // `locked` is deliberately not persisted. It means "a pricing request is in flight
+      // right now", and no request survives a page reload — so a lock read back from
+      // storage is always stale, and a stale lock is a trolley that refuses every scan
+      // with no explanation. That is precisely the fault this once caused.
+      partialize: (state) => ({
+        items: state.items,
+        totalPrice: state.totalPrice,
+        totalExpectedWeight: state.totalExpectedWeight,
+        guestSessionId: state.guestSessionId,
+      }),
+      // Phones that hit the bug still have `locked: true` in storage from before it was
+      // excluded. Whatever comes back from disk, the lock starts released.
+      merge: (persisted, current) => ({
+        ...current,
+        ...(persisted as Partial<CartState>),
+        locked: false,
+      }),
+    }
+  )
+);

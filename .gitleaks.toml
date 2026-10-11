@@ -1,0 +1,29 @@
+# Gitleaks configuration for SnapUp.
+#
+# The default rule set does the work. What is added here is a short allow-list for the
+# deliberately fake credentials the acceptance suites use: they must look like real
+# secrets for the tests to be meaningful, and must not fail the scan.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Test fixtures: secrets that exist to be rejected"
+paths = [
+  '''scripts/validate-requirements\.mjs''',
+  '''scripts/validate-billing\.mjs''',
+  '''scripts/validate-presence\.mjs''',
+  '''scripts/validation-fixtures\.mjs''',
+]
+regexes = [
+  '''do-not-deploy''',
+  '''a-secret-the-attacker-guessed-wrong''',
+  '''suite-(app-id|key-secret)''',
+]
+
+[[allowlists]]
+description = "Documented development fallbacks, refused in production by env.ts"
+regexes = ['''dev-only-[a-z-]+-never-use-in-production''']
+
+[[allowlists]]
+description = "Placeholder values in the environment template"
+paths = ['''\.env\.example''']

@@ -1,0 +1,36 @@
+#!/bin/sh
+# Stops a secret reaching a commit, which is the only point at which stopping it is cheap.
+# Once a secret is committed and pushed it must be rotated, whatever happens next.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+set -e
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$staged" ] && exit 0
+
+# Environment files, other than the documented template.
+for file in $staged; do
+  case "$file" in
+    .env.example) ;;
+    *.env|.env|.env.*|*/.env|*/.env.*)
+      echo "pre-commit: refusing to commit $file — environment files hold secrets."
+      exit 1 ;;
+    *.pem|*.key|*.p12|*.pfx|id_rsa|*/id_rsa)
+      echo "pre-commit: refusing to commit $file — this looks like a private key."
+      exit 1 ;;
+  esac
+done
+
+# Provider key formats and connection strings in the staged content itself.
+pattern='cfsk_ma_(prod|test)_[A-Za-z0-9]{8,}|rzp_(live|test)_[A-Za-z0-9]{8,}|sk_(live|test)_[A-Za-z0-9]{12,}|GOCSPX-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|ghp_[A-Za-z0-9]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|postgres(ql)?://[^:/ ]+:[^@/ ]{6,}@'
+
+if git diff --cached -U0 | grep -nE "^\+" | grep -vE "do-not-deploy|dev-only-|never-use-in-production|example" | grep -qE "$pattern"; then
+  echo "pre-commit: a staged change looks like a live credential."
+  echo "Nothing was committed. Remove the value and use an environment variable."
+  exit 1
+fi
+
+# If gitleaks is installed locally, let it have the last word.
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks protect --staged --redact --no-banner
+fi

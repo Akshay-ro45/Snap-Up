@@ -1,0 +1,24 @@
+node_modules
+.next
+out
+# Every env file except the documented template. `.env*.local` alone left a plain `.env`
+# or `.env.production` committable, which is the usual way a secret reaches git.
+.env
+.env.*
+!.env.example
+.DS_Store
+*.tsbuildinfo
+next-env.d.ts
+.turbo
+
+# Embedded Postgres data directory (PGlite). Real database contents — accounts, password
+# hashes, orders. Never committed.
+/.data/
+
+# Scratch space for one-off scripts. Never part of the product.
+/.tmp/
+
+# Local HTTPS certificates (next dev --experimental-https). Private keys; never committed.
+certificates/
+
+.github/workflows/

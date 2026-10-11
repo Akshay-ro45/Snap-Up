@@ -1,0 +1,919 @@
+-- SnapUp durable schema.
+--
+-- Applied by `npm run db:migrate`. Every statement is idempotent, so re-running it against
+-- an existing database is a no-op rather than an error.
+--
+-- Two conventions carried over from the in-memory repositories, both load-bearing:
+--
+--   * Money is `integer` paise, never `numeric` or `float`. The application does integer
+--     arithmetic throughout and a rounding difference between the two layers would show up
+--     as a receipt that disagrees with the dashboard by a paisa.
+--   * Nothing is ever deleted. Products and stores carry `is_active`, because orders
+--     reference them by id and a deleted row would orphan a paid order.
+
+-- ---------------------------------------------------------------------------
+-- Stores
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS stores (
+  id                      text PRIMARY KEY,
+  name                    text NOT NULL,
+  address                 text NOT NULL,
+
+  -- Decimal degrees, WGS84. `double precision` rather than `numeric`: the haversine
+  -- calculation is floating point anyway, and metre-level accuracy is far beyond what a
+  -- browser's geolocation reports.
+  --
+  -- Nullable, because a branch is registered from its published address days before anyone
+  -- visits it to take a reading. NULL means "not surveyed". It is deliberately not
+  -- defaulted to 0: that is a real coordinate off the coast of Ghana, and an unsurveyed
+  -- branch sitting there sorts ~2 000 km from every customer while looking well-formed.
+  latitude                double precision,
+  longitude               double precision,
+
+  -- The store's authorized customer-Wi-Fi egress ranges. An empty array can never grant a
+  -- session, which is the fail-closed behaviour a store registered without its network
+  -- details must have.
+  authorized_egress_cidrs text[] NOT NULL DEFAULT '{}',
+
+  advertised_ssid         text NOT NULL,
+  merchant_vpa            text,
+  merchant_display_name   text,
+
+  -- Per-branch retail API. A chain does not necessarily run one system: branches get
+  -- acquired at different times, run different POS versions, or sit behind their own
+  -- site-local server with no central aggregation. NULL falls back to the platform-wide
+  -- SNAPUP_STORE_API_BASE / SNAPUP_STORE_API_KEY.
+  api_base_url            text,
+
+  -- The NAME of an environment variable, never a key. This table is backed up, dumped, and
+  -- read by the admin console; a credential stored here is a credential that leaks.
+  api_key_ref             text,
+
+  is_active               boolean NOT NULL DEFAULT true,
+  is_open                 boolean NOT NULL DEFAULT true,
+  created_at              timestamptz NOT NULL DEFAULT now(),
+
+  -- A half-entered coordinate is always a mistake — one degree alone cannot be used for
+  -- anything, and a record stuck that way looks surveyed to a glance at the console.
+  CONSTRAINT stores_coordinates_paired CHECK ((latitude IS NULL) = (longitude IS NULL)),
+
+  -- Enforces env-var shape, which also rejects a pasted secret: real keys almost always
+  -- contain characters outside this set, so this catches the mistake at the database
+  -- rather than after it has been committed to a backup.
+  CONSTRAINT stores_api_key_ref_shape CHECK (
+    api_key_ref IS NULL OR api_key_ref ~ '^[A-Z][A-Z0-9_]{0,63}$'
+  )
+);
+
+-- Ids stay in the `store_N` shape the admin console and the validation harness expect,
+-- rather than becoming UUIDs. A sequence gives that shape without the read-max-then-insert
+-- race a naive `MAX(id) + 1` would carry.
+CREATE SEQUENCE IF NOT EXISTS store_id_seq AS bigint START 1;
+
+-- ---------------------------------------------------------------------------
+-- Stores: in-place migration for databases created before per-branch APIs
+-- ---------------------------------------------------------------------------
+--
+-- `CREATE TABLE IF NOT EXISTS` above is a no-op on an existing database, so the columns
+-- and the relaxed nullability have to be applied separately. All of this is idempotent.
+
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS api_base_url text;
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS api_key_ref  text;
+
+ALTER TABLE stores ALTER COLUMN latitude  DROP NOT NULL;
+ALTER TABLE stores ALTER COLUMN longitude DROP NOT NULL;
+
+-- Existing rows sitting at exactly 0,0 are almost certainly "unknown" written by a form
+-- that had no way to say so, not a genuine reading in the Gulf of Guinea. Promote them to
+-- NULL so the readiness report can see them.
+UPDATE stores SET latitude = NULL, longitude = NULL
+ WHERE latitude = 0 AND longitude = 0;
+
+DO $$
+BEGIN
+  ALTER TABLE stores ADD CONSTRAINT stores_coordinates_paired
+    CHECK ((latitude IS NULL) = (longitude IS NULL));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$
+BEGIN
+  ALTER TABLE stores ADD CONSTRAINT stores_api_key_ref_shape
+    CHECK (api_key_ref IS NULL OR api_key_ref ~ '^[A-Z][A-Z0-9_]{0,63}$');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- Products
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS products (
+  id                    text PRIMARY KEY,
+  store_id              text NOT NULL REFERENCES stores (id),
+  barcode               text NOT NULL,
+  name                  text NOT NULL,
+  category              text NOT NULL,
+
+  -- Nullable: the aisle-traffic report falls back to `category`, so a store gets useful
+  -- location insight before anyone has surveyed the shop.
+  aisle                 text,
+
+  image_url             text NOT NULL,
+  unit_price            integer NOT NULL,
+  expected_weight_grams integer NOT NULL,
+  is_active             boolean NOT NULL DEFAULT true,
+
+  -- Commercially sensitive. Requirement 2 forbids any of these reaching a customer; that is
+  -- enforced in `products/projection.ts`, which copies out an allowlist field by field.
+  cost_price            integer NOT NULL,
+  profit_margin_pct     real NOT NULL,
+  supplier_name         text NOT NULL,
+  supplier_contact      text NOT NULL,
+  stock_quantity        integer NOT NULL,
+  internal_sku          text NOT NULL,
+  purchase_history      jsonb NOT NULL DEFAULT '[]'::jsonb
+);
+
+-- The Requirement 3 hot path, and the constraint the in-memory barcode map was standing in
+-- for. Two rows with the same barcode in one store would make a scan result depend on
+-- iteration order.
+CREATE UNIQUE INDEX IF NOT EXISTS products_store_barcode_idx
+  ON products (store_id, barcode);
+
+-- Serves both the operator listing and the paginated customer search, which order by name.
+CREATE INDEX IF NOT EXISTS products_store_name_idx
+  ON products (store_id, name);
+
+CREATE SEQUENCE IF NOT EXISTS product_id_seq AS bigint START 1;
+
+-- ---------------------------------------------------------------------------
+-- Orders
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS orders (
+  id                    text PRIMARY KEY,
+  store_id              text NOT NULL REFERENCES stores (id),
+
+  -- The anonymous shopping session, not a customer identity.
+  session_id            text NOT NULL,
+  status                text NOT NULL CHECK (status IN ('awaiting_payment', 'paid', 'abandoned')),
+
+  subtotal_paise        integer NOT NULL,
+  discount_paise        integer NOT NULL,
+  platform_fee_paise    integer NOT NULL,
+  total_paise           integer NOT NULL,
+
+  -- Cost of goods, for the margin figure on the owner's dashboard. Internal only.
+  total_cost_paise      integer NOT NULL,
+  expected_weight_grams integer NOT NULL,
+
+  -- Epoch milliseconds, matching the domain type exactly. Storing these as `timestamptz`
+  -- would round-trip through two conversions for no benefit, and the application compares
+  -- them against `Date.now()`.
+  created_at            bigint NOT NULL,
+  paid_at               bigint,
+
+  payee_vpa             text,
+  payee_name            text,
+  transaction_ref       text NOT NULL,
+  confirmation          text NOT NULL
+    CHECK (confirmation IN ('unconfirmed', 'customer_attested', 'staff_verified', 'psp_webhook', 'in_store_tender'))
+);
+
+-- Ownership lookup: `findForSession` is what stops one customer reading another's basket.
+CREATE INDEX IF NOT EXISTS orders_session_idx ON orders (session_id);
+CREATE INDEX IF NOT EXISTS orders_store_created_idx ON orders (store_id, created_at DESC);
+
+-- Lines get their own table rather than a jsonb blob on the order: "how many units of X did
+-- we sell" is the whole reason for collecting them, and that query wants rows.
+CREATE TABLE IF NOT EXISTS order_lines (
+  order_id              text NOT NULL REFERENCES orders (id) ON DELETE CASCADE,
+
+  -- Position within the order. Part of the key so line ordering survives a round trip
+  -- rather than depending on whatever order the planner returns.
+  line_no               integer NOT NULL,
+
+  product_id            text NOT NULL,
+  barcode               text NOT NULL,
+
+  -- Name and prices are copied, not joined. An event records what was true when it
+  -- happened: re-pricing an item next week must not restate last week's revenue.
+  name                  text NOT NULL,
+  quantity              integer NOT NULL,
+  unit_price_paise      integer NOT NULL,
+  line_paise            integer NOT NULL,
+  unit_cost_paise       integer NOT NULL,
+  line_cost_paise       integer NOT NULL,
+  expected_weight_grams integer NOT NULL,
+
+  PRIMARY KEY (order_id, line_no)
+);
+
+-- ---------------------------------------------------------------------------
+-- Analytics event log
+-- ---------------------------------------------------------------------------
+
+-- Append-only and immutable. The dashboard is a read model over this, never a set of
+-- counters mutated in place: a counter that drifts cannot be reconciled, whereas an event
+-- log can be re-aggregated when a metric definition changes.
+CREATE TABLE IF NOT EXISTS store_events (
+  id          text PRIMARY KEY,
+
+  -- Append order, used only as a tiebreak. `occurred_at` has millisecond resolution and a
+  -- session that starts and ends inside the same millisecond is not hypothetical in tests.
+  -- Without a monotonic tiebreak those two events could come back in either order, and the
+  -- average-shopping-time calculation would read a negative duration.
+  seq         bigserial NOT NULL,
+
+  store_id    text NOT NULL REFERENCES stores (id),
+  session_id  text NOT NULL,
+  kind        text NOT NULL
+    CHECK (kind IN ('session_started', 'session_ended', 'product_scanned', 'scan_missed', 'order_placed')),
+  occurred_at bigint NOT NULL,
+
+  -- The kind-specific fields. Kept as jsonb rather than thirty mostly-null columns, since
+  -- every query filters by store and window first and reads the payload afterwards.
+  payload     jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+
+-- The only index that matters: every dashboard query is "this store, this window".
+CREATE INDEX IF NOT EXISTS store_events_store_occurred_idx
+  ON store_events (store_id, occurred_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- Accounts
+-- ---------------------------------------------------------------------------
+--
+-- SnapUp's own data, not the retailer's. Who may sign in is our question, so unlike
+-- products and orders there is no retailer-API backend for this table — an outage at one
+-- branch must not lock staff out of the console for all eight.
+--
+-- Nothing here is ever deleted. Orders and analytics reference a user id, and "who
+-- approved this refund" has to stay answerable, so removal is `is_active = false`.
+
+CREATE TABLE IF NOT EXISTS users (
+  id            text PRIMARY KEY,
+
+  role          text NOT NULL DEFAULT 'customer'
+    CHECK (role IN ('owner', 'manager', 'staff', 'customer')),
+
+  -- E.164 digits, no '+'. The customer app signs in by phone and OTP, so for a customer
+  -- this is their whole identity. Staff may have one too — that is how an owner signs in
+  -- to the customer app as well as the console.
+  phone         text UNIQUE,
+
+  -- Console identity. Customers normally have none.
+  email         text UNIQUE,
+
+  -- scrypt, as 'scrypt$N$r$p$salt$hash'. NULL for phone-only accounts: there is no
+  -- password to steal from an account that has never had one.
+  password_hash text,
+
+  name          text,
+
+  -- Branch this staff member belongs to. Recorded now so that when per-branch scoping is
+  -- enforced, the data already exists rather than having to be reconstructed from memory.
+  store_id      text REFERENCES stores (id),
+
+  is_active     boolean NOT NULL DEFAULT true,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  last_login_at timestamptz,
+
+  -- An account has to be reachable by something, or it can never sign in.
+  CONSTRAINT users_have_an_identifier CHECK (phone IS NOT NULL OR email IS NOT NULL),
+
+  -- A console role must be able to use the console, which means email + password.
+  CONSTRAINT staff_can_sign_in CHECK (
+    role = 'customer' OR (email IS NOT NULL AND password_hash IS NOT NULL)
+  )
+);
+
+-- Case-insensitive email uniqueness. The UNIQUE above is case-sensitive, so without this
+-- 'Owner@shop.in' and 'owner@shop.in' would be two accounts that both look correct.
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_idx ON users (lower(email))
+  WHERE email IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS users_role_idx ON users (role) WHERE role <> 'customer';
+
+-- ---------------------------------------------------------------------------
+-- One-time codes
+-- ---------------------------------------------------------------------------
+--
+-- The code is stored HASHED and peppered with a server-side secret. A challenge row is a
+-- live credential until it expires; plaintext here would let anyone with read access to
+-- the database sign in as any customer who happened to be mid-login. Six digits is only a
+-- million candidates, so the pepper — held in the environment, never in this table — is
+-- what makes a leaked dump useless.
+
+CREATE TABLE IF NOT EXISTS otp_challenges (
+  id          text PRIMARY KEY,
+  phone       text NOT NULL,
+  code_hash   text NOT NULL,
+  expires_at  timestamptz NOT NULL,
+
+  -- Capped in the application. Unlimited guesses against a five-minute window would make
+  -- six digits entirely brute-forceable.
+  attempts    integer NOT NULL DEFAULT 0,
+
+  consumed_at timestamptz,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- Serves the only query on this table: newest live challenge for a number.
+CREATE INDEX IF NOT EXISTS otp_challenges_phone_idx
+  ON otp_challenges (phone, created_at DESC) WHERE consumed_at IS NULL;
+
+-- ---------------------------------------------------------------------------
+-- Password resets
+-- ---------------------------------------------------------------------------
+--
+-- Console accounts only. Customers sign in with a phone and a one-time code, so there is
+-- no password to forget and nothing here ever applies to them — which is a genuine
+-- security property rather than a gap: the most commonly abused account-recovery flow
+-- simply does not exist for the larger population.
+--
+-- The token is stored HASHED, for the same reason the OTP is. A reset row is a live
+-- credential capable of taking over an owner account until it expires; anyone with read
+-- access to this table could otherwise walk straight in. Unlike the OTP the token is
+-- long and random, so a plain SHA-256 is sufficient — there is no candidate space to
+-- brute-force.
+
+CREATE TABLE IF NOT EXISTS password_resets (
+  id         text PRIMARY KEY,
+  user_id    text NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+  token_hash text NOT NULL,
+
+  -- One hour. Long enough to find the message and act on it, short enough that a link
+  -- left sitting in an inbox is not a standing key to the console.
+  expires_at timestamptz NOT NULL,
+
+  used_at    timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+
+  -- Recorded so a reset can be traced afterwards. Not used as an access control input:
+  -- a legitimate user routinely requests from one network and completes from another.
+  requested_ip text
+);
+
+-- Serves both queries on this table: "is this token live" and "invalidate this user's
+-- outstanding resets".
+CREATE INDEX IF NOT EXISTS password_resets_user_idx
+  ON password_resets (user_id, created_at DESC) WHERE used_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS password_resets_token_idx ON password_resets (token_hash);
+
+-- ---------------------------------------------------------------------------
+-- Orders: staff payment verification
+-- ---------------------------------------------------------------------------
+--
+-- Under the direct-to-merchant UPI model no payment provider ever tells us a transfer
+-- happened, so the only evidence available is a member of staff looking at the shop's own
+-- UPI app and saying yes. These columns record who did that and when.
+--
+-- Attribution is the entire point. "The gate opened and the money never arrived" has to be
+-- answerable, and an anonymous boolean cannot answer it. `verified_by` references a real
+-- user, which is why removing a staff member deactivates rather than deletes them.
+
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS verified_by   text REFERENCES users (id);
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS verified_at   bigint;
+
+-- Short, human-typeable handle the customer shows at the exit. Six characters from an
+-- unambiguous alphabet: staff read it off a phone screen under fluorescent light and type
+-- it on a till, so O/0 and I/1 are excluded rather than trusted to context.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS verification_code text;
+
+CREATE UNIQUE INDEX IF NOT EXISTS orders_verification_code_idx
+  ON orders (verification_code) WHERE verification_code IS NOT NULL;
+
+-- 'awaiting_verification' sits between a customer's claim and a staff confirmation. It
+-- exists so the two are never conflated: an order in this state has been attested and not
+-- verified, which is exactly the distinction the exit gate depends on.
+DO $$
+BEGIN
+  ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_status_check;
+  ALTER TABLE orders ADD CONSTRAINT orders_status_check
+    CHECK (status IN ('awaiting_payment', 'awaiting_verification', 'paid', 'abandoned'));
+EXCEPTION WHEN others THEN NULL;
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- Orders: ownership
+-- ---------------------------------------------------------------------------
+--
+-- An order is created against an anonymous *shopping* session, which is deliberate: the
+-- catalogue must be usable without an account. But "My Bills" has to survive that session
+-- ending, and a shopper who signs in should see their history on a new phone.
+--
+-- Nullable, because a guest checkout is a legitimate outcome and has no account to attach.
+-- Those bills live only on the device that made them.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS user_id text REFERENCES users (id);
+
+CREATE INDEX IF NOT EXISTS orders_user_created_idx
+  ON orders (user_id, created_at DESC) WHERE user_id IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- Branch credentials: a key that can be pasted but never read back
+-- ---------------------------------------------------------------------------
+--
+-- `api_key_ref` names an environment variable and is the right answer for a deployment
+-- somebody operates with a terminal. It is the wrong answer for a pilot, where the person
+-- running the shop cannot edit the hosting environment — so the console needs a field they
+-- can paste a key into.
+--
+-- What is stored is the ciphertext, never the key. `api_key_masked` and
+-- `api_key_fingerprint` are what the console renders: together they answer "is a key set"
+-- and "is it still the one I pasted" without the secret leaving the server. See
+-- `stores/credentials.ts` for the format and its limits.
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS api_key_sealed      text;
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS api_key_masked      text;
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS api_key_fingerprint text;
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS api_key_set_at      bigint;
+
+-- ---------------------------------------------------------------------------
+-- Orders: the weight check at the exit
+-- ---------------------------------------------------------------------------
+--
+-- The basket's expected weight is already computed from the catalogue at order time. This
+-- records what the scale at the exit actually read, so the two can be compared by a member
+-- of staff before the customer leaves.
+--
+-- `weight_override_by` is the column that matters. A basket can disagree with its expected
+-- weight for entirely innocent reasons — packaged goods vary from their printed weight,
+-- scales drift, produce is weighed at a counter — and a check that strands a paying
+-- customer at the gate with no recourse is worse than one that can be overridden. So staff
+-- may approve a mismatch, and doing so writes down who did it and by how much. That record
+-- is the whole safeguard: an override nobody can attribute is indistinguishable from no
+-- check at all.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS observed_weight_grams integer;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS weight_checked_by     text REFERENCES users (id);
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS weight_checked_at     bigint;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS weight_override_by    text REFERENCES users (id);
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS exit_approved_at      bigint;
+
+-- ---------------------------------------------------------------------------
+-- Stores: opening hours
+-- ---------------------------------------------------------------------------
+--
+-- Minutes since local midnight, 0–1439. Not a timestamp and not a time zone: a shop opens
+-- at nine in the morning where it stands, and every branch here is in one country. Storing
+-- wall-clock minutes keeps "09:00" the same string the owner typed, through every backup
+-- and restore, with no offset arithmetic to get wrong twice a year.
+--
+-- Nullable, because a branch is registered before anyone confirms its hours, and because
+-- some shops genuinely do not keep fixed ones. Null means "hours not stated" — the
+-- directory then falls back to the manual `is_open` flag rather than inventing a schedule.
+--
+-- `closes_at_minutes` less than `opens_at_minutes` means the shop closes after midnight
+-- (22:00–02:00). That is a real case for a metro bazaar and the comparison has to allow
+-- for it, so it is written down here rather than discovered as a bug at 1am.
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS opens_at_minutes  integer;
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS closes_at_minutes integer;
+
+DO $$ BEGIN
+  ALTER TABLE stores DROP CONSTRAINT IF EXISTS stores_hours_range_check;
+  ALTER TABLE stores ADD CONSTRAINT stores_hours_range_check
+    CHECK (
+      (opens_at_minutes  IS NULL OR (opens_at_minutes  >= 0 AND opens_at_minutes  <= 1439)) AND
+      (closes_at_minutes IS NULL OR (closes_at_minutes >= 0 AND closes_at_minutes <= 1439))
+    );
+EXCEPTION WHEN others THEN NULL;
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- Keep store_id_seq ahead of the ids already in the table
+-- ---------------------------------------------------------------------------
+--
+-- `create()` mints ids as 'store_' || nextval('store_id_seq'), but the CSV importer writes
+-- ids straight from the sheet — store_1, store_2 — and an explicit insert does not advance
+-- a sequence. So after any import the sequence still points at 1, and the first shop
+-- registered through the console dies on:
+--
+--     duplicate key value violates unique constraint "stores_pkey"
+--
+-- which reads as a bug in signup rather than as a sequence that was never caught up.
+--
+-- Idempotent, and safe to run on every migration: it only ever moves the sequence forward,
+-- to the highest numeric suffix present. Ids with no digits are ignored rather than
+-- treated as zero.
+SELECT setval(
+  'store_id_seq',
+  GREATEST(
+    (SELECT COALESCE(MAX(NULLIF(regexp_replace(id, '[^0-9]', '', 'g'), '')::bigint), 0) FROM stores),
+    1
+  )
+);
+
+-- ---------------------------------------------------------------------------
+-- Customer identity: username and password
+-- ---------------------------------------------------------------------------
+--
+-- The pilot spec excludes OTP and asks for basic username/password sign-in, so a customer
+-- now needs an identifier that is neither a phone number nor a work email. `username` is
+-- that identifier.
+--
+-- Stored case-folded in a separate column rather than lower-cased in place, because the
+-- name a person typed is the one they should see on their own account. `username_folded`
+-- is what uniqueness and lookup use, so "Dharsan" and "dharsan" cannot both be registered
+-- while the display keeps whichever was chosen.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS username        text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS username_folded text;
+
+CREATE UNIQUE INDEX IF NOT EXISTS users_username_folded_idx
+  ON users (username_folded) WHERE username_folded IS NOT NULL;
+
+-- The original constraint predates usernames and required a phone or an email. A pilot
+-- customer now has neither: the specification excludes OTP, so they register with a
+-- username and a password and are asked for nothing else. Widened rather than dropped —
+-- an account reachable by nothing at all still cannot sign in, and that is worth refusing
+-- at the table rather than discovering as a support call.
+DO $$ BEGIN
+  ALTER TABLE users DROP CONSTRAINT IF EXISTS users_have_an_identifier;
+  ALTER TABLE users ADD CONSTRAINT users_have_an_identifier
+    CHECK (phone IS NOT NULL OR email IS NOT NULL OR username_folded IS NOT NULL);
+EXCEPTION WHEN others THEN NULL;
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- Products: brand, MRP and the Snap Up discount
+-- ---------------------------------------------------------------------------
+--
+-- The supplied catalogue carries four money figures per item: MRP, Sell, Discount and
+-- Final. They are not interchangeable and the pilot checkout depends on the difference.
+--
+--   mrp_paise       the printed maximum price, shown struck through
+--   unit_price      what anybody pays -- the catalogue's "Sell"
+--   discount_paise  the Snap Up discount, applied only to a signed-in customer
+--
+-- Section 3 of the pilot specification makes that last distinction load-bearing: a guest
+-- sees "Snap Up Discount ₹0 — Login to redeem" and the same basket costs less once they
+-- sign in. Storing only a final price would make that impossible to express, and storing
+-- a percentage would let guest and member totals disagree by a rounding paisa.
+--
+-- Derived as Sell − Final rather than read from the "Discount" column, which appears as a
+-- flat rupee amount, a percentage, or "None" depending on the row. One subtraction is
+-- exact for all three.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS brand          text;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS mrp_paise      integer;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS discount_paise integer NOT NULL DEFAULT 0;
+
+DO $$ BEGIN
+  ALTER TABLE products DROP CONSTRAINT IF EXISTS products_discount_not_negative;
+  ALTER TABLE products ADD CONSTRAINT products_discount_not_negative
+    CHECK (discount_paise >= 0);
+EXCEPTION WHEN others THEN NULL;
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- Orders: the payment summary, line by line
+-- ---------------------------------------------------------------------------
+--
+-- The pilot bill has more shape than a subtotal and a total, and each line has to survive
+-- into the order record — a receipt reprinted next month must show what was actually
+-- charged, not what today's rates would produce.
+--
+--   product_savings_paise  the shop's own markdowns, for "you saved"
+--   service_fee_paise      one tenth of the item total, charged to a guest
+--   discount_paise         the member waiver: equals the fee, or zero
+--   gst_paise              tax, zero until a rate is configured
+--
+-- `platform_fee_paise` already exists and now carries the same figure as
+-- `service_fee_paise`; it is kept because analytics and older rows read it.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_savings_paise integer NOT NULL DEFAULT 0;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS service_fee_paise     integer NOT NULL DEFAULT 0;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS gst_paise             integer NOT NULL DEFAULT 0;
+
+-- ---------------------------------------------------------------------------
+-- The exit gate: Deny, and delayed inventory finalisation
+-- ---------------------------------------------------------------------------
+--
+-- Payment being confirmed is not the end of the journey. The customer receives an exit QR,
+-- a member of staff scans it, and only Proceed releases the final bill and moves stock.
+-- Sections 6 and 7 of the pilot specification both turn on that delay, and both call the
+-- alternatives — a bill released early, stock decremented at payment — incomplete.
+--
+-- `exit_approved_at` already exists and is the authorisation. These are its counterparts:
+--
+--   exit_denied_at / _by / _reason   staff refused. An auditable exception, not a deletion:
+--                                    the money was taken and the basket is disputed, so the
+--                                    record has to say who refused it and why.
+--   inventory_finalised_at           the idempotency guard for the stock write. Without it a
+--                                    second Proceed on the same order decrements twice, and
+--                                    the shop's count drifts down every time somebody taps
+--                                    a button they think did nothing.
+--
+-- Denial and approval are deliberately separate columns rather than one status. An order
+-- that was denied and later approved has to retain both facts; a single column would lose
+-- the refusal the moment it was overturned, which is exactly the history worth keeping.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS exit_denied_at        bigint;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS exit_denied_by        text REFERENCES users (id);
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS exit_denial_reason    text;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS inventory_finalised_at bigint;
+
+-- Bills are read by exit authorisation, and a shopper with a long history reads them often.
+CREATE INDEX IF NOT EXISTS orders_user_exit_idx
+  ON orders (user_id, exit_approved_at DESC)
+  WHERE user_id IS NOT NULL AND exit_approved_at IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- Per-store Wi-Fi credentials, and who changed them
+-- ---------------------------------------------------------------------------
+--
+-- The SSID is already here and is not a secret — it is broadcast to the whole car park.
+-- The password is, so it is sealed with the same AES-256-GCM machinery as a branch API key
+-- (`stores/credentials.ts`) rather than stored in the clear beside it.
+--
+-- It is never returned by any customer API and never by the admin API either: the console
+-- shows a mask and the fact that one is set. The pilot spec asks for the field so staff
+-- stop passing the password around on paper, not so the app can display it — a password
+-- that renders in a browser is a password in that browser's cache, history and screenshots.
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS wifi_password_sealed text;
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS wifi_password_set_at bigint;
+
+-- Configuration changes carry an actor and a timestamp, as §8 requires. Kept on the store
+-- rather than in a general audit log because it answers one specific question a shop owner
+-- asks — "who changed our network settings, and when" — and a row that has to be joined to
+-- three others to answer it is a row nobody consults.
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS network_updated_at bigint;
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS network_updated_by text REFERENCES users (id);
+
+-- ---------------------------------------------------------------------------
+-- Products: GST already inside the price
+-- ---------------------------------------------------------------------------
+--
+-- Indian retail prices are GST-inclusive: the MRP on the packet already contains the tax,
+-- and the customer never pays it on top. The bill still has to *show* it — that is a
+-- regulatory expectation, not a charge — so the figure is stored per SKU and summed onto
+-- the bill as an informational line.
+--
+-- Pre-computed upstream rather than derived here. The retailer's `product_pricing` table
+-- carries `gst_amount` alongside `taxable_value`, `cgst_amount` and `sgst_amount`, all of
+-- which have to agree for a GSTR filing. Recomputing one of them from a rate in this
+-- application would eventually disagree with the other three by a paisa, and the filing is
+-- the thing that has to be right.
+--
+-- Only `gst_amount` and `gst_rate` are held here. CGST, SGST, the taxable value and the HSN
+-- code are the retailer's compliance records and have no business in a customer-facing
+-- store — see the bill generation guide's list of fields that must never reach a client.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS gst_amount_paise integer NOT NULL DEFAULT 0;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS gst_rate_bp      integer;
+
+DO $$ BEGIN
+  ALTER TABLE products DROP CONSTRAINT IF EXISTS products_gst_not_negative;
+  ALTER TABLE products ADD CONSTRAINT products_gst_not_negative
+    CHECK (gst_amount_paise >= 0 AND (gst_rate_bp IS NULL OR gst_rate_bp >= 0));
+EXCEPTION WHEN others THEN NULL;
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- Stores: how close a customer must be
+-- ---------------------------------------------------------------------------
+--
+-- Metres from the surveyed coordinates. 100 by default: a supermarket floor, its
+-- entrance, and the forecourt the customer Wi-Fi actually reaches.
+--
+-- Null means no geofence — the branch relies on the network check alone, which is the
+-- right behaviour for a shop that has not been surveyed. A radius around coordinates that
+-- do not exist would refuse everybody.
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS geofence_radius_m integer DEFAULT 100;
+
+-- `ADD COLUMN IF NOT EXISTS` is a no-op once the column exists, so the default above never
+-- reaches a database migrated while it was still 50. Set it explicitly, and lift the rows
+-- still sitting on the old default. A branch deliberately surveyed to some other radius is
+-- left alone — only the value that was never chosen is changed.
+ALTER TABLE stores ALTER COLUMN geofence_radius_m SET DEFAULT 100;
+UPDATE stores SET geofence_radius_m = 100 WHERE geofence_radius_m = 50;
+
+DO $$ BEGIN
+  ALTER TABLE stores DROP CONSTRAINT IF EXISTS stores_geofence_sane;
+  ALTER TABLE stores ADD CONSTRAINT stores_geofence_sane
+    CHECK (geofence_radius_m IS NULL OR (geofence_radius_m >= 10 AND geofence_radius_m <= 5000));
+EXCEPTION WHEN others THEN NULL;
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- Billing workflow: gateway payments, immutable bills, and the sync outbox.
+--
+-- From SnapUp_Intern_Billing_Workflow_Guide.pdf, sections 2, 6 and 7. Every
+-- statement here is idempotent, so this file stays safe to re-run.
+--
+-- NOTE: not applied to the pilot database. The brief withholds Neon changes
+-- until the project owner approves them, and every code path that reads these
+-- columns is gated behind configuration that is absent, so an unmigrated
+-- database keeps working exactly as it does today.
+-- ---------------------------------------------------------------------------
+
+-- The state machine from section 2. `payment_state` is deliberately separate from
+-- `status`: `status` is the shopper's view of their basket, this is the money's
+-- view of itself, and conflating them is how a refund ends up looking like an
+-- abandoned cart.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_state text
+  CHECK (payment_state IS NULL OR payment_state IN (
+    'CART',
+    'PAYMENT_PENDING',
+    'PAYMENT_RECEIVED_PENDING_STAFF',
+    'APPROVED_COMPLETED',
+    'DECLINED_OR_CANCELLED',
+    'REFUNDED'
+  ));
+
+-- Which gateway, and its own identifiers. Kept as plain text because they are
+-- someone else's opaque strings and parsing them would only invent constraints.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS gateway            text;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS gateway_order_id   text;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS gateway_payment_id text;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS idempotency_key    text;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS failure_reason     text;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS bill_number        text;
+
+-- The uniqueness that makes section 9E hold. A repeated webhook, a refreshed
+-- page and a staff double-click all converge on one of these three keys, and the
+-- database refuses the duplicate rather than the application remembering to.
+-- Partial, because every one of these is NULL until a gateway is configured and
+-- a plain unique index would collapse every unmigrated order into one.
+CREATE UNIQUE INDEX IF NOT EXISTS orders_bill_number_key
+  ON orders (bill_number) WHERE bill_number IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS orders_gateway_payment_key
+  ON orders (gateway, gateway_payment_id) WHERE gateway_payment_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS orders_idempotency_key
+  ON orders (idempotency_key) WHERE idempotency_key IS NOT NULL;
+
+-- Section 5: exactly one bill number per approved sale.
+--
+-- Advanced only by the UPDATE that completes the sale, for the one row it matches, so a
+-- refused or replayed approval never consumes a number. The format is SU<yymmdd>-<serial>,
+-- sixteen characters, which is the ceiling a GST invoice serial is allowed. The date is the
+-- shop's, not the server's: the pilot is in Tamil Nadu and a bill approved at 00:30 IST
+-- carries that day, whatever UTC says.
+CREATE SEQUENCE IF NOT EXISTS bill_number_seq AS bigint START 1;
+
+-- Section 6: the bill as it was, not as the catalogue is now.
+--
+-- Deliberately a copy rather than a join. A bill is a statement about a moment —
+-- what was charged, at what price, at what tax — and rebuilding it from today's
+-- products table would silently reprice last month's receipt the next time
+-- somebody edits a price. The product id is kept for analysis, without a foreign
+-- key, so delisting an item cannot orphan or alter a bill that mentions it.
+CREATE TABLE IF NOT EXISTS bill_items (
+  order_id        text NOT NULL REFERENCES orders (id) ON DELETE CASCADE,
+  line_no         integer NOT NULL,
+
+  product_id      text NOT NULL,
+  internal_sku    text NOT NULL,
+  barcode         text NOT NULL,
+  -- Frozen at approval: the label that was printed, whatever the item is called now.
+  label           text NOT NULL,
+
+  quantity        integer NOT NULL CHECK (quantity > 0),
+  unit_price_paise integer NOT NULL,
+  line_total_paise integer NOT NULL,
+  gst_amount_paise integer NOT NULL DEFAULT 0,
+  gst_rate_bp      integer,
+
+  PRIMARY KEY (order_id, line_no)
+);
+
+-- Section 7: the change log the 30-minute sync reads.
+--
+-- Append-only, and written in the same statement as the change it describes —
+-- that is the whole point. An outbox written afterwards can be lost between the
+-- two writes, which is the failure it exists to prevent.
+CREATE TABLE IF NOT EXISTS outbox (
+  id            bigserial PRIMARY KEY,
+  event_type    text NOT NULL,
+  store_id      text NOT NULL,
+  -- The order, product or import this concerns. Not a foreign key: the log must
+  -- outlive whatever it describes.
+  subject_id    text NOT NULL,
+  payload       jsonb NOT NULL,
+
+  created_at    bigint NOT NULL,
+  -- Set only once the original database has confirmed the write, never before.
+  synced_at     bigint,
+  attempts      integer NOT NULL DEFAULT 0,
+  last_error    text
+);
+
+-- The sync job's only query: oldest unconfirmed events first.
+CREATE INDEX IF NOT EXISTS outbox_pending_idx
+  ON outbox (created_at) WHERE synced_at IS NULL;
+
+-- Which run currently owns this event.
+--
+-- `SELECT … FOR UPDATE SKIP LOCKED` cannot do this job here. The HTTP driver has no
+-- session, so every statement is its own transaction (see the note in `db/client.ts`) and
+-- the row lock is released the instant the SELECT returns — two overlapping runs would
+-- both "claim" the same events and both send them, and because every event is a relative
+-- delta the original would apply each one twice.
+--
+-- A claim written to the row survives the statement that took it. `claimed_at` doubles as
+-- the expiry: a run that dies mid-flight leaves its claim behind, and the next run takes
+-- events back once the claim is older than `CLAIM_TTL_MS`.
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS claimed_at bigint;
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS claimed_by text;
+
+-- Events with nothing to send — a payment state change, under an inventory-only origin
+-- mapping. Distinct from `synced_at` on purpose: "we wrote this to the original" and
+-- "there was nothing about this for the original to know" must not look the same to
+-- whoever reads this table after an incident.
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS skipped_at     bigint;
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS skipped_reason text;
+
+-- One row per run, so a failure has somewhere to be seen from.
+CREATE TABLE IF NOT EXISTS sync_runs (
+  id            text PRIMARY KEY,
+  started_at    bigint NOT NULL,
+  finished_at   bigint,
+  events_sent   integer NOT NULL DEFAULT 0,
+  events_failed integer NOT NULL DEFAULT 0,
+  outcome       text,
+  detail        jsonb
+);
+
+ALTER TABLE sync_runs ADD COLUMN IF NOT EXISTS events_skipped integer NOT NULL DEFAULT 0;
+-- Section 7's reconciliation: what was compared, and what disagreed.
+ALTER TABLE sync_runs ADD COLUMN IF NOT EXISTS reconciliation jsonb;
+
+-- ---------------------------------------------------------------------------
+-- Section 8: who increased stock, and when
+-- ---------------------------------------------------------------------------
+--
+-- An import moves real stock. "The count is wrong" is answerable only if each movement
+-- names its source, its actor and its mode — an import that added 40 and a stock-take that
+-- declared 40 are different events that leave the column looking identical.
+CREATE TABLE IF NOT EXISTS stock_imports (
+  id          bigserial PRIMARY KEY,
+  store_id    text NOT NULL,
+  product_id  text NOT NULL,
+  internal_sku text NOT NULL,
+  barcode     text NOT NULL,
+
+  -- `increase` adds to the shelf; `stock_take` declares an absolute count. Section 8 makes
+  -- the first the default and the second something someone has to ask for.
+  mode        text NOT NULL CHECK (mode IN ('increase', 'stock_take')),
+  quantity    integer NOT NULL,
+  qty_before  integer NOT NULL,
+  qty_after   integer NOT NULL,
+
+  -- Free text: a console user id, or whoever ran the importer. Never blank.
+  imported_by text NOT NULL,
+  source      text NOT NULL,
+  imported_at bigint NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS stock_imports_store_idx
+  ON stock_imports (store_id, imported_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- Presence verification (spec §4, §6.3, §6.5)
+-- ---------------------------------------------------------------------------
+
+-- The Store Presence Agent: a small always-on process inside the shop that proves, by
+-- heartbeat, that the shop's network is reachable and what its egress identity currently
+-- is. It replaces the manually typed public IP, which the spec forbids (§9.2, §16) for a
+-- concrete reason: a consumer ISP changes the address without warning, and a shop whose
+-- staff must retype it is a shop that silently stops admitting customers on a Sunday.
+--
+-- The agent authenticates with a bootstrap secret shown once at registration; only its
+-- hash is kept here, so a reader of this table cannot impersonate an agent.
+CREATE TABLE IF NOT EXISTS store_presence_agents (
+  id              text PRIMARY KEY,
+  store_id        text NOT NULL REFERENCES stores (id) ON DELETE CASCADE,
+  name            text NOT NULL,
+
+  -- scrypt, same construction as user passwords. Never the raw secret.
+  credential_hash text NOT NULL,
+
+  -- Written by the heartbeat, never by a human. This is the whole point of the mechanism.
+  last_seen_at    bigint,
+  last_observed_network text,
+  agent_version   text,
+
+  -- REVOKED is terminal and set from the console; ONLINE/STALE/OFFLINE are derived from
+  -- last_seen_at at read time rather than stored, so a stale row cannot claim to be live.
+  status          text NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'REVOKED')),
+
+  created_at      bigint NOT NULL,
+  created_by      text,
+  revoked_at      bigint,
+  revoked_by      text
+);
+
+CREATE INDEX IF NOT EXISTS store_presence_agents_store_idx
+  ON store_presence_agents (store_id, status, last_seen_at DESC);
+
+-- Spec §3.3: an entrance QR token may be redeemed once. Without this, a code photographed
+-- from the display inside the shop can be handed to someone outside and used until it
+-- expires. The network gate still stands behind it, but defence in depth is the point of
+-- having two gates.
+--
+-- Rows are kept only until the token they refer to would have expired anyway; anything
+-- older is noise and is deleted on write.
+CREATE TABLE IF NOT EXISTS qr_replay_nonces (
+  nonce_hash text PRIMARY KEY,
+  store_id   text NOT NULL,
+  used_at    bigint NOT NULL,
+  expires_at bigint NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS qr_replay_nonces_expiry_idx ON qr_replay_nonces (expires_at);
