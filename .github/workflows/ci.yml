@@ -1,0 +1,63 @@
+name: CI
+
+# Every push and every pull request. Nothing reaches production without passing this.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: a secret removed from the working tree but still present in an
+          # earlier commit is exactly what this job exists to catch.
+          fetch-depth: 0
+      - name: Scan working tree and history
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: false
+
+  verify:
+    name: Typecheck, build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: No SQL built by string interpolation
+        run: node scripts/check-sql-safety.mjs
+
+      - name: Typecheck
+        run: |
+          npm --workspace apps/customer-web exec tsc -- --noEmit -p tsconfig.json
+          npm --workspace apps/admin-web exec tsc -- --noEmit -p tsconfig.json
+
+      - name: Build
+        run: |
+          npm run build:customer
+          npm run build:admin
+
+      - name: No secrets in the client bundle
+        run: node scripts/check-bundle-safety.mjs
+
+      # Each suite provisions its own throwaway embedded database. None of them touches
+      # a hosted database, so CI never needs a production credential to test.
+      - name: Requirements suite
+        run: node scripts/validate-requirements.mjs --no-build
+      - name: Billing suite
+        run: node scripts/validate-billing.mjs --no-build
+      - name: Presence suite
+        run: node scripts/validate-presence.mjs --no-build

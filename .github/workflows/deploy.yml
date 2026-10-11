@@ -1,0 +1,45 @@
+name: Deploy
+
+# Deploys only after CI has passed on main. Replaces `railway up` from a laptop, which
+# shipped whatever happened to be in the working directory.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to Railway
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    # A GitHub environment, so the deploy history records what shipped and when, and so
+    # reviewers can be required later without changing this file.
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm i -g @railway/cli
+      - name: Deploy customer gateway
+        run: railway up --service snapup-monorepo --environment production --ci
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      - name: Deploy admin console
+        run: railway up --service snapup-admin --environment production --ci
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      - name: Health check
+        run: |
+          set -e
+          for host in snapup-monorepo snapup-admin; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --retry 10 --retry-delay 10 --retry-all-errors \
+              "https://$host-production.up.railway.app/api/health")
+            echo "$host -> $code"
+            [ "$code" = "200" ]
+          done

@@ -1,0 +1,65 @@
+name: Migrate database
+
+# Schema changes are deliberately NOT part of deploying the application. This workflow is
+# the only path to the client's schema, it runs by hand, it requires an approval on the
+# `database` environment, and it takes a snapshot before it touches anything.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type the word MIGRATE to confirm'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    name: Apply schema to production
+    runs-on: ubuntu-latest
+    # Protect this environment with required reviewers in repository settings. Until that
+    # is configured, the typed confirmation below is the only gate.
+    environment: database
+    steps:
+      - name: Confirm intent
+        run: |
+          [ "${{ inputs.confirm }}" = "MIGRATE" ] || {
+            echo "Confirmation text did not match. Nothing was run."; exit 1; }
+
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      # Taken first, every time, by the job itself rather than by whoever remembered.
+      - name: Snapshot before migrating
+        env:
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+          NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+          NEON_BRANCH_ID: ${{ secrets.NEON_BRANCH_ID }}
+        run: node scripts/neon-snapshot.mjs "pre-migration-$(date -u +%Y%m%dT%H%M%SZ)"
+
+      # Checked before the first statement, because this migration runner applies
+      # statements one at a time: a credential that runs out of privilege half-way leaves
+      # the schema matching neither version.
+      - name: Can this credential finish?
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_MIGRATOR }}
+        run: node scripts/check-migration-privileges.mjs
+
+      - name: Apply schema
+        env:
+          # The migrator credential, never the runtime one and never the owner. Held only
+          # in this environment's secrets.
+          DATABASE_URL: ${{ secrets.DATABASE_URL_MIGRATOR }}
+        run: npm run db:migrate
+
+      - name: Application still healthy
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' --retry 6 --retry-delay 10 --retry-all-errors \
+            https://snapup-monorepo-production.up.railway.app/api/health)
+          echo "health -> $code"
+          [ "$code" = "200" ]

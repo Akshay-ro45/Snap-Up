@@ -1,0 +1,59 @@
+name: Backup
+
+# The Neon plan in use caps point-in-time recovery at six hours and does not offer a
+# scheduled-snapshot feature, so the schedule lives here instead. A daily snapshot plus a
+# weekly dump held outside Neon is what turns "six hours" into something survivable.
+on:
+  schedule:
+    - cron: '30 18 * * *'   # 00:00 IST daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    name: Daily Neon snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Create snapshot
+        env:
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+          NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+          NEON_BRANCH_ID: ${{ secrets.NEON_BRANCH_ID }}
+        run: node scripts/neon-snapshot.mjs "daily-$(date -u +%Y%m%d)"
+
+  export:
+    name: Weekly export held outside Neon
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 18 * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install client matching the server major version
+        run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update && sudo apt-get install -y postgresql-client-18
+
+      - name: Dump with the read-only role
+        env:
+          # Read-only by design: a backup job has no business holding a credential that
+          # can write to the thing it is backing up.
+          PGSSLMODE: require
+          DATABASE_URL_READONLY: ${{ secrets.DATABASE_URL_READONLY }}
+        run: |
+          pg_dump --no-owner --no-privileges --format=custom \
+            --file="snapup-$(date -u +%Y%m%d).dump" "$DATABASE_URL_READONLY"
+          ls -lh *.dump
+
+      # Kept for 90 days, outside the Neon account. If that account is lost — compromise,
+      # billing, mistake — this is the copy that is still reachable.
+      - name: Retain
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapup-db-export
+          path: '*.dump'
+          retention-days: 90
